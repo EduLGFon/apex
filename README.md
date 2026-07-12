@@ -24,7 +24,7 @@
       started too** — while the manager installs and the AUR build keep
       running in the background.
 
-   4. Everything is joined at the end and a summary is printed.
+   4. Everything is joined at the end and a summary is printed, includind both the actual (parallel) time taken and what the same work would have cost if every step had run one after another.
 
  Anything not present (pacman, apt, dnf, yay/paru, flatpak, snap) is
  skipped automatically.
