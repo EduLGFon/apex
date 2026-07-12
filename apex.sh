@@ -1,63 +1,82 @@
 #!/usr/bin/env bash
 #
-# apex.sh — Parallelized system updater for Linux (Arch, Flatpak, Snap).
+# apex.sh — Parallelized system updater
+# (Arch pacman+AUR, Debian/Ubuntu apt, Fedora/RHEL dnf,
+#  plus flatpak and snap)
+#
+# The script does NOT assume these are mutually exclusive — pacman, apt,
+# and dnf are each detected independently and handled if present, whether
+# alone or side by side (e.g. inside containers/WSL/unusual setups).
 #
 # STRATEGY (minimize wall-clock time, without racing anything unsafe):
 #
-#   1. pacman downloads all official-repo updates WITHOUT installing (-w).
-#      This is the only phase that's guaranteed to compete for your download
-#      bandwidth, so nothing else starts until it's finished.
+#   1. For every system package manager found (pacman, apt, dnf), run its
+#      "download only, don't install" step, ONE AT A TIME. These are the
+#      only steps guaranteed to compete for your download bandwidth, so
+#      they're kept serialized against each other and against everything
+#      else.
 #
-#   2. The instant that download finishes, two things start at once:
-#        a) pacman installs the already-downloaded packages (disk/CPU only,
-#           no network)
-#        b) your AUR helper (yay/paru) starts resolving + cloning + building
-#           AUR updates
+#   2. Once all of those download steps are done, everything below starts
+#      together in the background:
+#        - each manager's real install/upgrade step (reads from its cache,
+#          so it's disk/CPU work, not network)
+#        - your AUR helper (yay/paru), which resolves + clones + builds
+#          AUR updates
 #
-#   3. As soon as the AUR helper finishes its upfront dependency
-#      resolution/cloning burst and starts actually building packages, we
-#      start flatpak, then snap, one after another — all while pacman's
-#      install and the AUR build keep running in the background.
+#   3. As soon as the AUR helper finishes its upfront resolve/clone burst
+#      and starts actually building packages, flatpak then snap are
+#      started too — while the manager installs and the AUR build keep
+#      running in the background.
 #
 #   4. Everything is joined at the end and a summary is printed.
 #
-# Anything you don't have installed (yay/paru, flatpak, snap) is skipped
-# automatically.
+# Anything not present (pacman, apt, dnf, yay/paru, flatpak, snap) is
+# skipped automatically.
 #
-# HOW STEP 3 IS DETECTED
+# HOW STEP 3'S AUR TIMING IS DETECTED
 #   Both yay and paru shell out to the real `makepkg` binary to build
 #   packages. makepkg's very first line of output for any package is
 #   always:
 #       ==> Making package: <name> <version> (<date>)
-#   That line is emitted by makepkg itself (not the AUR helper), and has
-#   been stable across versions for years — it's a much steadier target
-#   than parsing yay/paru's own wrapper output. We watch the AUR helper's
-#   log for the first occurrence of that line and treat it as "the bulk
-#   download burst (dependency resolution + AUR git clones) is done, real
-#   building has started" — a reasonable, if not perfectly exact, proxy.
-#   Per-package source downloads inside individual builds can still trickle
-#   in after this point; those are typically small next to compile time, so
-#   the residual bandwidth overlap is an acceptable trade for not blocking
-#   flatpak/snap on the *entire* AUR job.
-#   To make sure that line is always in English no matter your system
-#   locale, we force LC_ALL=C for just that one subprocess.
-#   If you'd rather not rely on this heuristic at all, pass --conservative
-#   to wait for the whole AUR job to finish before starting flatpak/snap.
+#   That line comes from makepkg itself (not the AUR helper's own wrapper
+#   text), and has been stable across versions for years. We watch the AUR
+#   helper's log for the first occurrence of that line and treat it as "the
+#   upfront download burst is done, real building has started" — a
+#   reasonable, if not perfectly exact, proxy. Per-package source downloads
+#   inside individual builds can still trickle in after this point; those
+#   are typically small next to compile time. LC_ALL=C is forced on that
+#   one subprocess so the line is always in English regardless of your
+#   system locale. Pass --conservative to skip this heuristic entirely and
+#   just wait for the whole AUR job to finish first.
+#
+# NOTES ON apt / dnf
+#   - apt runs with DEBIAN_FRONTEND=noninteractive and
+#     --force-confdef/--force-confold so a config-file prompt can't
+#     silently hang a background job; when in doubt it keeps your current
+#     config file.
+#   - dnf's --downloadonly needs the "download" plugin from
+#     dnf-plugins-core. If it's missing, the download-only step will fail;
+#     the script logs that but keeps going — the later install step still
+#     does a normal (download+install) upgrade, it just won't have had the
+#     benefit of pre-fetching.
 #
 # SAFETY NOTES
 #   - To run the AUR helper unattended, this script auto-accepts
 #     diffs/prompts (--noconfirm + answer flags). You lose the manual
 #     "review the PKGBUILD" step. Review AUR packages separately/
 #     periodically if that matters to you.
-#   - In theory, pacman's install step and the AUR helper's own final
+#   - In theory, a manager's own install step and the AUR helper's final
 #     `pacman -U` could both want the pacman DB lock at once. In practice
 #     this essentially never happens, since building AUR packages takes far
-#     longer than installing already-cached repo packages — but if you ever
-#     see "unable to lock database", just re-run the script.
+#     longer than installing already-cached packages — but if you ever see
+#     "unable to lock database", just re-run the script.
 #
 set -uo pipefail
 
 # ---------- options ----------
+SKIP_PACMAN=0
+SKIP_APT=0
+SKIP_DNF=0
 SKIP_AUR=0
 SKIP_FLATPAK=0
 SKIP_SNAP=0
@@ -68,6 +87,9 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
 
+  --no-pacman      Skip pacman even if present
+  --no-apt         Skip apt even if present
+  --no-dnf         Skip dnf even if present
   --no-aur         Skip AUR updates even if a helper is installed
   --no-flatpak     Skip flatpak updates
   --no-snap        Skip snap updates
@@ -82,6 +104,9 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --no-pacman) SKIP_PACMAN=1 ;;
+        --no-apt) SKIP_APT=1 ;;
+        --no-dnf) SKIP_DNF=1 ;;
         --no-aur) SKIP_AUR=1 ;;
         --no-flatpak) SKIP_FLATPAK=1 ;;
         --no-snap) SKIP_SNAP=1 ;;
@@ -109,7 +134,17 @@ human_time() {
 
 SCRIPT_START=$(date +%s)
 
-# ---------- detect what we have ----------
+# ---------- detect system package managers (independently, no assumptions) ----------
+MANAGERS=()
+[[ $SKIP_PACMAN -eq 0 ]] && command -v pacman  &>/dev/null && MANAGERS+=(pacman)
+[[ $SKIP_APT    -eq 0 ]] && command -v apt-get &>/dev/null && MANAGERS+=(apt)
+[[ $SKIP_DNF    -eq 0 ]] && command -v dnf     &>/dev/null && MANAGERS+=(dnf)
+
+if [[ ${#MANAGERS[@]} -eq 0 ]]; then
+    warn "No supported system package manager (pacman/apt/dnf) found or all skipped."
+fi
+
+# ---------- detect AUR helper (only meaningful alongside pacman) ----------
 AUR_HELPER=""
 if [[ $SKIP_AUR -eq 0 ]]; then
     for helper in yay paru; do
@@ -126,45 +161,82 @@ HAS_FLATPAK=0
 HAS_SNAP=0
 [[ $SKIP_SNAP -eq 0 ]] && command -v snap &>/dev/null && HAS_SNAP=1
 
+# ---------- per-manager download / install commands ----------
+manager_download() {
+    case "$1" in
+        pacman)
+            sudo pacman -Syuw --noconfirm
+            ;;
+        apt)
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -d -y
+            ;;
+        dnf)
+            sudo dnf upgrade --refresh --downloadonly -y
+            ;;
+    esac
+}
+
+manager_install() {
+    case "$1" in
+        pacman)
+            sudo pacman -Su --noconfirm
+            ;;
+        apt)
+            sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold"
+            ;;
+        dnf)
+            sudo dnf upgrade -y
+            ;;
+    esac
+}
+
 # ---------- sudo keep-alive ----------
-log "Requesting sudo access up front (needed for pacman/snap)..."
-if ! sudo -v; then
-    fail "Could not get sudo access. Aborting."
-    exit 1
+if [[ ${#MANAGERS[@]} -gt 0 || $HAS_SNAP -eq 1 ]]; then
+    log "Requesting sudo access up front..."
+    if ! sudo -v; then
+        fail "Could not get sudo access. Aborting."
+        exit 1
+    fi
+    ( while true; do sudo -n -v; sleep 60; done ) &
+    SUDO_KEEPALIVE_PID=$!
+else
+    SUDO_KEEPALIVE_PID=""
 fi
-( while true; do sudo -n -v; sleep 60; done ) &
-SUDO_KEEPALIVE_PID=$!
 
 AUR_LOG=""
 AUR_PID=""
-PACMAN_INSTALL_PID=""
+declare -A INSTALL_PID=()
 
 cleanup() {
-    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
     [[ -n "$AUR_PID" ]] && kill "$AUR_PID" 2>/dev/null
-    [[ -n "$PACMAN_INSTALL_PID" ]] && kill "$PACMAN_INSTALL_PID" 2>/dev/null
+    for mgr in "${!INSTALL_PID[@]}"; do
+        kill "${INSTALL_PID[$mgr]}" 2>/dev/null
+    done
     [[ -n "$AUR_LOG" && -f "$AUR_LOG" ]] && rm -f "$AUR_LOG"
 }
 trap cleanup EXIT INT TERM
 
-PACMAN_DL_STATUS=0
-PACMAN_INSTALL_STATUS=0
+declare -A DOWNLOAD_STATUS=()
+declare -A INSTALL_STATUS=()
 AUR_STATUS=0
 FLATPAK_STATUS=0
 SNAP_STATUS=0
 
 # Runs the AUR helper with output forced to English (for reliable marker
-# detection) and line-buffered (so the log fills in real time, not in
-# big chunks), tee'd to both the terminal and a log file we can grep.
+# detection) and line-buffered (so the log fills in real time), tee'd to
+# both the terminal and a log file we can grep.
 run_aur_and_log() {
     LC_ALL=C LANG=C stdbuf -oL -eL "$@" 2>&1 | tee "$AUR_LOG"
     return "${PIPESTATUS[0]}"
 }
 
 # Blocks until makepkg's "Making package:" line shows up in the AUR log
-# (i.e. the AUR helper has moved from resolving/cloning into building),
-# or until the AUR job exits on its own (nothing to build / errored out),
-# or until a generous safety timeout elapses.
+# (AUR helper moved from resolving/cloning into building), or the AUR job
+# exits on its own (nothing to build / errored), or a safety timeout hits.
 wait_for_aur_build_start() {
     local marker='^==> Making package:'
     local waited=0
@@ -186,25 +258,34 @@ wait_for_aur_build_start() {
     done
 }
 
-# ---------- phase: pacman download-only ----------
-section "pacman — downloading official repo updates"
-T0=$(date +%s)
-sudo pacman -Syuw --noconfirm
-PACMAN_DL_STATUS=$?
-T1=$(date +%s)
-if [[ $PACMAN_DL_STATUS -eq 0 ]]; then
-    ok "pacman downloads finished in $(human_time $((T1 - T0)))"
-else
-    fail "pacman download phase failed (exit $PACMAN_DL_STATUS)"
-    exit 1
+# ---------- phase: download-only for each system package manager, serialized ----------
+if [[ ${#MANAGERS[@]} -gt 0 ]]; then
+    section "Downloading system package updates (${MANAGERS[*]}, one at a time)"
+    for mgr in "${MANAGERS[@]}"; do
+        log "Downloading $mgr updates..."
+        T0=$(date +%s)
+        manager_download "$mgr"
+        DOWNLOAD_STATUS[$mgr]=$?
+        T1=$(date +%s)
+        if [[ ${DOWNLOAD_STATUS[$mgr]} -eq 0 ]]; then
+            ok "$mgr downloads finished in $(human_time $((T1 - T0)))"
+        else
+            fail "$mgr download-only step failed (exit ${DOWNLOAD_STATUS[$mgr]})"
+            if [[ "$mgr" == "dnf" ]]; then
+                warn "This often means the 'download' plugin (dnf-plugins-core) isn't installed. Continuing — dnf's install step below will just download+install together."
+            fi
+        fi
+    done
 fi
 
-# ---------- kick off pacman install + AUR build in the background ----------
-section "Starting pacman install + AUR update in the background"
+# ---------- kick off all installs + AUR build in the background ----------
+section "Starting installs + AUR update in the background"
 
-log "Starting pacman install (from cache, no network use)..."
-sudo pacman -Su --noconfirm &
-PACMAN_INSTALL_PID=$!
+for mgr in "${MANAGERS[@]}"; do
+    log "Starting $mgr install..."
+    manager_install "$mgr" &
+    INSTALL_PID[$mgr]=$!
+done
 
 if [[ -n "$AUR_HELPER" ]]; then
     AUR_LOG=$(mktemp /tmp/aur-update-log.XXXXXX)
@@ -281,13 +362,15 @@ fi
 # ---------- join remaining background jobs ----------
 section "Finishing up background jobs"
 
-wait "$PACMAN_INSTALL_PID"
-PACMAN_INSTALL_STATUS=$?
-if [[ $PACMAN_INSTALL_STATUS -eq 0 ]]; then
-    ok "pacman install finished"
-else
-    fail "pacman install failed (exit $PACMAN_INSTALL_STATUS)"
-fi
+for mgr in "${MANAGERS[@]}"; do
+    wait "${INSTALL_PID[$mgr]}"
+    INSTALL_STATUS[$mgr]=$?
+    if [[ ${INSTALL_STATUS[$mgr]} -eq 0 ]]; then
+        ok "$mgr install finished"
+    else
+        fail "$mgr install failed (exit ${INSTALL_STATUS[$mgr]})"
+    fi
+done
 
 if [[ -n "$AUR_PID" ]]; then
     wait "$AUR_PID"
@@ -307,8 +390,14 @@ section "Summary"
 echo "Total time: $(human_time $TOTAL)"
 
 OVERALL_STATUS=0
-for pair in "pacman-download:$PACMAN_DL_STATUS" "pacman-install:$PACMAN_INSTALL_STATUS" \
-            "aur:$AUR_STATUS" "flatpak:$FLATPAK_STATUS" "snap:$SNAP_STATUS"; do
+
+for mgr in "${MANAGERS[@]}"; do
+    if [[ ${INSTALL_STATUS[$mgr]:-0} -ne 0 ]]; then
+        fail "$mgr failed (exit ${INSTALL_STATUS[$mgr]})"
+        OVERALL_STATUS=1
+    fi
+done
+for pair in "aur:$AUR_STATUS" "flatpak:$FLATPAK_STATUS" "snap:$SNAP_STATUS"; do
     name="${pair%%:*}"
     status="${pair##*:}"
     if [[ "$status" -ne 0 ]]; then
