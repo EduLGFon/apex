@@ -134,8 +134,6 @@ human_time() {
     printf '%dm%02ds' $((s / 60)) $((s % 60))
 }
 
-SCRIPT_START=$(date +%s)
-
 # ---------- detect system package managers (independently, no assumptions) ----------
 MANAGERS=()
 [[ $SKIP_PACMAN -eq 0 ]] && command -v pacman  &>/dev/null && MANAGERS+=(pacman)
@@ -268,6 +266,12 @@ wait_for_aur_build_start() {
 }
 
 # ---------- phase: download-only for each system package manager, serialized ----------
+# The clock starts here, not at script launch — this excludes the sudo
+# password prompt, tool detection, and setup from both timing numbers, so
+# "time with/without parallelization" measures actual update work, not how
+# long you took to type your password.
+SCRIPT_START=$(date +%s)
+
 if [[ ${#MANAGERS[@]} -gt 0 ]]; then
     section "Downloading system package updates (${MANAGERS[*]}, one at a time)"
     for mgr in "${MANAGERS[@]}"; do
