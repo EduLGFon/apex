@@ -62,6 +62,12 @@
 #     does a normal (download+install) upgrade, it just won't have had the
 #     benefit of pre-fetching.
 #
+# NOTE ON flatpak
+#   - flatpak runs with --noninteractive. Without it, flatpak can drop to
+#     a polkit authentication prompt for background helper actions (like
+#     refreshing appstream metadata) with no timeout, which would hang the
+#     script indefinitely since there's no terminal input to answer it.
+#
 # SAFETY NOTES
 #   - To run the AUR helper unattended, this script auto-accepts
 #     diffs/prompts (--noconfirm + answer flags). You lose the manual
@@ -226,8 +232,12 @@ declare -A INSTALL_STATUS=()
 declare -A INSTALL_TIME=()
 declare -A INSTALL_START=()
 AUR_STATUS=0
-AUR_TIME=0
+AUR_DOWNLOAD_TIME=0
+AUR_BUILD_TIME=0
 AUR_START_TS=0
+AUR_BUILD_START_TS=0
+AUR_NO_BUILD_END_TS=0
+AUR_MARKER_FOUND=0
 FLATPAK_STATUS=0
 FLATPAK_TIME=0
 SNAP_STATUS=0
@@ -244,6 +254,8 @@ run_aur_and_log() {
 # Blocks until makepkg's "Making package:" line shows up in the AUR log
 # (AUR helper moved from resolving/cloning into building), or the AUR job
 # exits on its own (nothing to build / errored), or a safety timeout hits.
+# Sets AUR_MARKER_FOUND=1 only in the first case, so callers can tell a
+# real download/build split from "there was nothing to split."
 wait_for_aur_build_start() {
     local marker='^==> Making package:'
     local waited=0
@@ -251,6 +263,7 @@ wait_for_aur_build_start() {
 
     while true; do
         if grep -qm1 -E "$marker" "$AUR_LOG" 2>/dev/null; then
+            AUR_MARKER_FOUND=1
             return 0
         fi
         if ! kill -0 "$AUR_PID" 2>/dev/null; then
@@ -329,13 +342,33 @@ if [[ -n "$AUR_PID" ]]; then
         log "Conservative mode: waiting for the AUR update to fully finish..."
         wait "$AUR_PID"
         AUR_STATUS=$?
-        AUR_TIME=$(( $(date +%s) - AUR_START_TS ))
-        if [[ $AUR_STATUS -eq 0 ]]; then ok "AUR update finished in $(human_time $AUR_TIME)"; else fail "AUR update failed (exit $AUR_STATUS)"; fi
+        # No marker wait happened in this mode, so there's no real
+        # download/build split to report: the whole run is timed as one
+        # block. We attribute it to "build" since that's most of what
+        # AUR jobs spend their time on.
+        AUR_BUILD_TIME=$(( $(date +%s) - AUR_START_TS ))
+        if [[ $AUR_STATUS -eq 0 ]]; then ok "AUR update finished in $(human_time $AUR_BUILD_TIME)"; else fail "AUR update failed (exit $AUR_STATUS)"; fi
         AUR_PID=""   # already reaped
     else
         log "Waiting for AUR's initial resolve/clone burst to finish before starting flatpak..."
         wait_for_aur_build_start
-        ok "AUR build phase reached, starting flatpak/snap now while it keeps building."
+        AUR_BUILD_START_TS=$(date +%s)
+        if [[ $AUR_MARKER_FOUND -eq 1 ]]; then
+            AUR_DOWNLOAD_TIME=$(( AUR_BUILD_START_TS - AUR_START_TS ))
+            ok "AUR download/resolve burst finished in $(human_time $AUR_DOWNLOAD_TIME), starting flatpak/snap now while it keeps building."
+        else
+            # The AUR job already exited before ever printing the build
+            # marker (nothing to update, or it failed outright) or we hit
+            # the safety timeout. Either way there's no build phase left
+            # to time. Record its end time right now: the process may
+            # already be dead, and a later `wait "$AUR_PID"` on an
+            # already-dead PID returns instantly, so if we computed the
+            # duration there instead, it would silently measure however
+            # long *other* things (like pacman's install) took in the
+            # meantime, not AUR's actual runtime.
+            AUR_NO_BUILD_END_TS=$(date +%s)
+            ok "AUR job finished before any build started, starting flatpak/snap now."
+        fi
     fi
 fi
 
@@ -345,7 +378,10 @@ section "flatpak, then snap"
 if [[ $HAS_FLATPAK -eq 1 ]]; then
     log "Updating flatpak packages..."
     T0=$(date +%s)
-    flatpak update -y
+    # --noninteractive keeps this from ever dropping to a polkit auth
+    # prompt (e.g. for the appstream-update helper action) that would
+    # otherwise hang the script forever with no visible terminal input.
+    flatpak update -y --noninteractive
     FLATPAK_STATUS=$?
     T1=$(date +%s)
     FLATPAK_TIME=$((T1 - T0))
@@ -395,9 +431,20 @@ done
 if [[ -n "$AUR_PID" ]]; then
     wait "$AUR_PID"
     AUR_STATUS=$?
-    AUR_TIME=$(( $(date +%s) - AUR_START_TS ))
+    if [[ $AUR_MARKER_FOUND -eq 1 ]]; then
+        AUR_BUILD_TIME=$(( $(date +%s) - AUR_BUILD_START_TS ))
+    else
+        # No build marker ever fired. AUR_NO_BUILD_END_TS was captured
+        # right when we detected that (see above), which is the AUR
+        # job's real end time. `wait` above almost certainly returned
+        # instantly since the process was already dead; using `date +%s`
+        # here instead would measure however long unrelated background
+        # work (pacman install, etc.) happened to still be running,
+        # not AUR's actual runtime.
+        AUR_BUILD_TIME=$(( AUR_NO_BUILD_END_TS - AUR_START_TS ))
+    fi
     if [[ $AUR_STATUS -eq 0 ]]; then
-        ok "AUR update finished in $(human_time $AUR_TIME)"
+        ok "AUR build finished in $(human_time $AUR_BUILD_TIME)"
     else
         fail "AUR update failed (exit $AUR_STATUS)"
     fi
@@ -414,7 +461,7 @@ SEQUENTIAL_TOTAL=0
 for mgr in "${MANAGERS[@]}"; do
     SEQUENTIAL_TOTAL=$((SEQUENTIAL_TOTAL + ${DOWNLOAD_TIME[$mgr]:-0} + ${INSTALL_TIME[$mgr]:-0}))
 done
-SEQUENTIAL_TOTAL=$((SEQUENTIAL_TOTAL + AUR_TIME + FLATPAK_TIME + SNAP_TIME))
+SEQUENTIAL_TOTAL=$((SEQUENTIAL_TOTAL + AUR_DOWNLOAD_TIME + AUR_BUILD_TIME + FLATPAK_TIME + SNAP_TIME))
 
 section "Summary"
 
@@ -442,7 +489,8 @@ for mgr in "${MANAGERS[@]}"; do
     printf "  %-10s %-10s %s\n" "$mgr" "install" "$(human_time ${INSTALL_TIME[$mgr]:-0})"
 done
 if [[ -n "$AUR_HELPER" ]]; then
-    printf "  %-10s %-10s %s\n" "aur" "" "$(human_time $AUR_TIME)"
+    printf "  %-10s %-10s %s\n" "aur" "download" "$(human_time $AUR_DOWNLOAD_TIME)"
+    printf "  %-10s %-10s %s\n" "aur" "build" "$(human_time $AUR_BUILD_TIME)"
 fi
 if [[ $HAS_FLATPAK -eq 1 ]]; then
     printf "  %-10s %-10s %s\n" "flatpak" "" "$(human_time $FLATPAK_TIME)"
